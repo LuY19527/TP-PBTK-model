@@ -1,1 +1,164 @@
 
+# ============================================================
+library(deSolve)
+library(FME)
+library(tidyverse)
+# ============================================================
+
+# 实验数据
+obs_data <- data.frame(
+  time = c(0, 0.5, 1, 2, 4, 6, 12, 24),
+  ROS  = c(1.0, 4.5, 3.0, 1.5, 1.2, 1.1, 1.05, 1.0),
+  Enz  = c(1.0, 1.2, 4.5, 3.0, 2.0, 2.2, 3.5, 3.2),
+  MDA  = c(1.0, 1.1, 1.5, 2.0, 1.8, 1.6, 1.4, 1.2) 
+)
+
+# 转换为长格式（FME 绘图更喜欢这种格式，或者保持原样也可以）
+# 这里保持原样，但在 modCost 中处理
+
+# 用于拟合的数据
+dat_fit <- obs_data[, c("time", "ROS", "Enz")]
+
+# 模型常量
+C_cell       <- 1.0
+t_switch     <- 4
+Km_fixed     <- 0.5   
+kel_fixed    <- 0.1   
+c_rate_fixed <- 2.0   
+
+# ============================================================
+# ODE 模型（修正安全性一致性）
+# ============================================================
+PFAS_Model <- function(t, state, pars) {
+  with(as.list(c(state, pars)), {
+    
+    # 强制非负，防止 NaN
+    ROS_safe <- max(ROS, 1e-10)
+    Enz_safe <- max(Enz, 1e-10)
+    
+    # 方程 1: ROS
+    dROS <- alpha * C_cell - 
+      Vmax * Enz_safe * ROS_safe / (Km_fixed + ROS_safe) - 
+      kel_fixed * ROS_safe  # 修正：这里也用 safe
+    
+    # 硬约束：导数不能让数值瞬间跌破0太多
+    # dROS <- max(dROS, -ROS / 1e-3) # 这种硬约束有时会导致求解器卡顿，先注释掉，靠 safe 足够
+    
+    # 开关函数
+    switch_val <- 1 / (1 + exp(-c_rate_fixed * (t - t_switch)))
+    
+    # 方程 2: Enz
+    dEnz <- k_fast * ROS_safe +    # 修正：用 ROS_safe
+      k_PPAR * ROS_safe * switch_val - 
+      k_use * Enz_safe * ROS_safe - 
+      k_deg * Enz_safe
+    
+    # dEnz <- max(dEnz, -Enz / 1e-3)
+    
+    return(list(c(dROS, dEnz)))
+  })
+}
+
+# ============================================================
+# Cost function
+# ============================================================
+ModelCost <- function(p) {
+  yini <- c(ROS = 1.0, Enz = 1.0)
+  times <- sort(unique(dat_fit$time))
+  
+  out <- tryCatch({
+    ode(y      = yini,
+        times  = times,
+        func   = PFAS_Model,
+        parms  = p,
+        method = "lsoda", 
+        rtol   = 1e-3,     
+        atol   = 1e-5)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(out)) return(list(residuals = rep(1e10, nrow(dat_fit)*2)))
+  
+  # 【修复1】：weight 改为 "mean"
+  cost <- modCost(model = out, 
+                  obs   = dat_fit, 
+                  x     = "time", 
+                  weight = "mean") # 关键修改
+  
+  return(cost)
+}
+
+# ============================================================
+# 阶段一：拟合
+# ============================================================
+pars_start <- c(alpha   = 10,   
+                Vmax    = 2,
+                k_fast  = 2,    
+                k_PPAR  = 1.2,  
+                k_use   = 0.8,  
+                k_deg   = 0.1)
+
+cat("正在进行拟合 (推荐用 Marq)...\n")
+
+# 建议：先用 Pseudo 粗调，再用 Marq 精调，或者直接用 Marq
+Fit <- modFit(f       = ModelCost,
+              p       = pars_start,
+              lower   = rep(1e-3, 6),
+              upper   = rep(20, 6),     
+              method  = "Marq") # 建议改回 Marq，Pseudo 太慢且精度低
+
+print(summary(Fit))
+
+# ============================================================
+# 阶段二：MCMC 采样
+# ============================================================
+cat("MCMC 采样中 (1000 次演示)...\n")
+
+# 1. 获取拟合后的残差方差作为先验
+var0_val <- Fit$var_ms_unweighted
+
+# 【修复】：使用 any() 处理向量判断，防止报错
+if (is.null(var0_val) || any(is.na(var0_val))) {
+  var0_val <- 1.0  # 如果获取失败，使用默认值
+}
+
+# 2. 运行 MCMC
+MCMC_res <- modMCMC(f          = ModelCost,
+                    p          = Fit$par,
+                    niter      = 1000,   # 演示用 1000，正式跑建议 5000+
+                    jump       = 0.1,    # 如果接受率(acceptance rate)太低，调小这个值
+                    var0       = var0_val,
+                    wvar0      = 0.1,    # 给予初始方差一定的权重
+                    updatecov  = 50)     # 每50次更新协方差矩阵以优化采样
+
+print(summary(MCMC_res))
+
+# ============================================================
+# 可视化 (修复)
+# ============================================================
+times_plot <- seq(0, 24, by = 0.1)
+yini <- c(ROS = 1.0, Enz = 1.0)
+
+# 1. 计算 MCMC 的预测带
+# 【修复2】：使用 parInput 传递链，并且只取最后 100 个样本以加快速度
+# niter 很大时 sensRange 会跑死，必须抽样
+chain_sample <- MCMC_res$pars[sample(nrow(MCMC_res$pars), 100), ]
+
+pred_range <- sensRange(func    = PFAS_Model,
+                        parInput = chain_sample, # 关键修改：用 parInput
+                        y       = yini,
+                        times   = times_plot)
+
+# 2. 使用 FME 自带的 plot 功能处理分面叠加
+# 【修复3】：使用 obs 参数自动叠加点，col 设置置信带颜色
+plot(summary(pred_range), 
+     obs  = dat_fit,           # 自动把数据点画在正确的图上
+     xlab = "Time (h)", 
+     ylab = "Relative Level",
+     main = "MCMC Prediction",
+     col  = c("pink", "lightblue"), # 置信带颜色
+     pch  = 16)                     # 数据点形状
+
+# 既然用了 FME 的 plot，它会自动分面。
+# 如果你想自定义图例，可以加 legend = TRUE/FALSE 控制
